@@ -599,9 +599,10 @@ if run_btn:
                     "Check that your device map and source files match."
                 )
             else:
-                n_timestamps = len(data_df)
-                n_values     = int(data_df.notna().sum().sum())
-                output_bytes = build_output(header_rows, data_df, n_cols, output_tz)
+                n_timestamps  = len(data_df)
+                n_values      = int(data_df.notna().sum().sum())
+                n_mapped_cols = len(data_df.columns)
+                output_bytes  = build_output(header_rows, data_df, n_cols, output_tz)
 
         except Exception as e:
             st.error(f"Error during processing: {e}")
@@ -612,7 +613,7 @@ if run_btn:
         st.success(
             f"✅  Done — {n_timestamps:,} timestamps, "
             f"{n_values:,} data values mapped across "
-            f"{len(col_series)} template columns"
+            f"{n_mapped_cols} template columns"
         )
         st.download_button(
             label="⬇  Download output CSV",
