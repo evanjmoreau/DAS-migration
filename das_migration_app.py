@@ -305,6 +305,7 @@ def process_files(
 
             # Build the src→template column index map on the first chunk only
             if chunk_num == 0:
+                claimed_cols: set[int] = set()   # template col indices already mapped
                 for src_col in chunk.columns:
                     if is_multi:
                         parts = src_col.split(".")
@@ -319,10 +320,13 @@ def process_files(
                             continue
                         wm, pi = mapping
                         cidx = col_map.get((wid, wm, pi))
-                        if cidx is not None:
+                        if cidx is not None and cidx not in claimed_cols:
                             col_idx_map[src_col] = cidx
+                            claimed_cols.add(cidx)
                             log(f"   ✓  {src_col} → {wid}/{wm} [idx={pi}] → col {cidx}")
                             file_mapped += 1
+                        elif cidx in claimed_cols:
+                            log(f"   –  {src_col} → col {cidx} already claimed by another source column, skipped")
                     else:
                         suffix  = src_col.split(".")[-1]
                         mapping = field_map.get(suffix)
@@ -330,21 +334,27 @@ def process_files(
                             continue
                         wm, pi  = mapping
                         cidx    = col_map.get((wattch_id, wm, pi))
-                        if cidx is not None:
+                        if cidx is not None and cidx not in claimed_cols:
                             col_idx_map[src_col] = cidx
+                            claimed_cols.add(cidx)
                             log(f"   ✓  {src_col} → col {cidx}")
                             file_mapped += 1
+                        elif cidx in claimed_cols:
+                            log(f"   –  {src_col} → col {cidx} already claimed by another source column, skipped")
 
             if not col_idx_map:
                 break
 
             # Keep only mapped columns, rename to int col index, cast to float32
+            # Group-by index to collapse any duplicate timestamps before appending
             mapped = (
                 chunk[list(col_idx_map.keys())]
                 .rename(columns=col_idx_map)
                 .apply(pd.to_numeric, errors="coerce")
                 .astype("float32")
             )
+            if mapped.index.duplicated().any():
+                mapped = mapped.groupby(level=0).mean()
             file_chunks.append(mapped)
             del chunk, mapped   # free immediately
 
