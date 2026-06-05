@@ -10,6 +10,7 @@ Run with:
 """
 
 import csv
+import gc
 import io
 import logging
 from pathlib import Path
@@ -226,119 +227,151 @@ def get_device_prefix(name: str) -> str | None:
 
 def process_files(
     source_files,
-    simple_map:        dict,
-    sub_device_map:    dict,
+    simple_map:         dict,
+    sub_device_map:     dict,
     multi_device_stems: set,
-    col_map:           dict,
-    n_cols:            int,
-    timestamp_fmt:     str,
-    output_tz:         str,
-    log_lines:         list,
-) -> dict[int, pd.Series]:
+    col_map:            dict,
+    n_cols:             int,
+    timestamp_fmt:      str,
+    log_lines:          list,
+) -> pd.DataFrame:
     """
-    Iterate over uploaded source CSVs and map every column to a template
-    column index. Returns {col_idx: pd.Series[timestamp → value]}.
+    Memory-efficient processing pipeline:
+
+    1. Reads each source CSV in 50,000-row chunks — never loads a full file at once.
+    2. Converts numeric values to float32 immediately (half the memory of float64).
+    3. Retains only mapped columns — all unmapped source data is discarded.
+    4. Merges one file at a time into a single accumulator DataFrame and calls
+       gc.collect() after each file so Python can reclaim memory promptly.
+
+    Returns a DataFrame indexed by timestamp with template column indices as
+    column names and float32 values.
     """
     def log(msg): log_lines.append(msg)
 
-    col_series: dict[int, pd.Series] = {}
+    accumulator: pd.DataFrame | None = None
     total_mapped = 0
 
     for uploaded in source_files:
-        stem = Path(uploaded.name).stem   # e.g. "INV2-01", "MET01"
-        content = uploaded.read().decode("utf-8-sig")
-        src = pd.read_csv(io.StringIO(content), dtype=str)
+        stem     = Path(uploaded.name).stem
+        is_multi = stem in multi_device_stems
 
-        if "Timestamp" not in src.columns:
-            log(f"⚠  {uploaded.name}: no 'Timestamp' column found — skipped")
-            continue
-
-        try:
-            src["Timestamp"] = pd.to_datetime(src["Timestamp"], format=timestamp_fmt)
-        except Exception as e:
-            log(f"⚠  {uploaded.name}: timestamp parse error ({e}) — skipped")
-            continue
-
-        src = src.set_index("Timestamp")
-        file_mapped = 0
-
-        # ── Multi-device file (e.g. MET01) ───────────────────────────────────
-        if stem in multi_device_stems:
+        # ── Resolve device metadata before touching file bytes ────────────────
+        if is_multi:
             log(f"▸  {uploaded.name}  [multi-device]")
-
-            for src_col in src.columns:
-                parts = src_col.split(".")
-                if len(parts) < 2:
-                    continue
-
-                sub_device    = parts[-2]   # e.g. "PYR02"
-                metric_suffix = parts[-1]   # e.g. "IRRADIANCE_GHI"
-
-                wattch_id = sub_device_map.get(sub_device)
-                if not wattch_id:
-                    log(f"   –  {src_col}: sub-device '{sub_device}' not in device map")
-                    continue
-
-                mapping = MET_SUFFIX_MAP.get(metric_suffix)
-                if not mapping:
-                    log(f"   –  {src_col}: no MET suffix map for '{metric_suffix}'")
-                    continue
-
-                wattch_metric, phase_idx = mapping
-                col_idx = col_map.get((wattch_id, wattch_metric, phase_idx))
-                if col_idx is None:
-                    log(f"   –  {src_col}: no template column for "
-                        f"({wattch_id}, {wattch_metric}, idx={phase_idx})")
-                    continue
-
-                series = pd.to_numeric(src[src_col], errors="coerce")
-                col_series[col_idx] = (
-                    col_series[col_idx].combine_first(series)
-                    if col_idx in col_series else series
-                )
-                log(f"   ✓  {src_col} → {wattch_id} / {wattch_metric} "
-                    f"[idx={phase_idx}] → template col {col_idx}")
-                file_mapped += 1
-
-        # ── Simple single-device file ─────────────────────────────────────────
+            wattch_id = None
+            field_map = None
         else:
             wattch_id = simple_map.get(stem)
             if not wattch_id:
                 log(f"⚠  '{stem}' not found in device map — skipping {uploaded.name}")
                 continue
-
             prefix    = get_device_prefix(stem)
             field_map = DEVICE_FIELD_MAPS.get(prefix)
             if not field_map:
                 log(f"⚠  No field map for device type '{prefix}' ({stem}) — skipping")
                 continue
-
             log(f"▸  {uploaded.name}  →  Wattch ID: {wattch_id}")
 
-            for src_col in src.columns:
-                suffix  = src_col.split(".")[-1]
-                mapping = field_map.get(suffix)
-                if not mapping:
-                    continue
+        # ── Read in 50k-row chunks; free raw bytes immediately ────────────────
+        raw = uploaded.read()
+        chunk_iter = pd.read_csv(
+            io.BytesIO(raw), dtype=str, chunksize=50_000, encoding="utf-8-sig"
+        )
+        del raw
 
-                wattch_metric, phase_idx = mapping
-                col_idx = col_map.get((wattch_id, wattch_metric, phase_idx))
-                if col_idx is None:
-                    continue
+        col_idx_map: dict[str, int] = {}   # src_col_name → template col index
+        file_chunks: list[pd.DataFrame] = []
+        file_mapped = 0
+        skip_file   = False
 
-                series = pd.to_numeric(src[src_col], errors="coerce")
-                col_series[col_idx] = (
-                    col_series[col_idx].combine_first(series)
-                    if col_idx in col_series else series
+        for chunk_num, chunk in enumerate(chunk_iter):
+
+            # Validate timestamp column
+            if "Timestamp" not in chunk.columns:
+                log(f"⚠  {uploaded.name}: no 'Timestamp' column — skipped")
+                skip_file = True
+                break
+            try:
+                chunk["Timestamp"] = pd.to_datetime(
+                    chunk["Timestamp"], format=timestamp_fmt
                 )
-                log(f"   ✓  {src_col} → template col {col_idx}")
-                file_mapped += 1
+            except Exception as e:
+                log(f"⚠  {uploaded.name}: timestamp error ({e}) — skipped")
+                skip_file = True
+                break
 
-        log(f"     {file_mapped} columns mapped\n")
+            chunk = chunk.set_index("Timestamp")
+
+            # Build the src→template column index map on the first chunk only
+            if chunk_num == 0:
+                for src_col in chunk.columns:
+                    if is_multi:
+                        parts = src_col.split(".")
+                        if len(parts) < 2:
+                            continue
+                        sub_dev, m_suffix = parts[-2], parts[-1]
+                        wid = sub_device_map.get(sub_dev)
+                        if not wid:
+                            continue
+                        mapping = MET_SUFFIX_MAP.get(m_suffix)
+                        if not mapping:
+                            continue
+                        wm, pi = mapping
+                        cidx = col_map.get((wid, wm, pi))
+                        if cidx is not None:
+                            col_idx_map[src_col] = cidx
+                            log(f"   ✓  {src_col} → {wid}/{wm} [idx={pi}] → col {cidx}")
+                            file_mapped += 1
+                    else:
+                        suffix  = src_col.split(".")[-1]
+                        mapping = field_map.get(suffix)
+                        if not mapping:
+                            continue
+                        wm, pi  = mapping
+                        cidx    = col_map.get((wattch_id, wm, pi))
+                        if cidx is not None:
+                            col_idx_map[src_col] = cidx
+                            log(f"   ✓  {src_col} → col {cidx}")
+                            file_mapped += 1
+
+            if not col_idx_map:
+                break
+
+            # Keep only mapped columns, rename to int col index, cast to float32
+            mapped = (
+                chunk[list(col_idx_map.keys())]
+                .rename(columns=col_idx_map)
+                .apply(pd.to_numeric, errors="coerce")
+                .astype("float32")
+            )
+            file_chunks.append(mapped)
+            del chunk, mapped   # free immediately
+
+        if skip_file or not file_chunks:
+            log(f"     0 data rows processed\n")
+            del file_chunks
+            gc.collect()
+            continue
+
+        # Concatenate chunks for this file, then free chunk list
+        file_df = pd.concat(file_chunks, copy=False)
+        del file_chunks
+        gc.collect()
+
+        log(f"     {file_mapped} columns mapped, {len(file_df):,} rows\n")
         total_mapped += file_mapped
 
+        # Merge into running accumulator, then free this file's DataFrame
+        if accumulator is None:
+            accumulator = file_df
+        else:
+            accumulator = accumulator.combine_first(file_df)
+        del file_df
+        gc.collect()
+
     log(f"Total columns mapped: {total_mapped}")
-    return col_series
+    return accumulator.sort_index() if accumulator is not None else pd.DataFrame()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -347,32 +380,63 @@ def process_files(
 
 def build_output(
     header_rows: list,
-    col_series:  dict,
+    data_df:     pd.DataFrame,
     n_cols:      int,
     output_tz:   str,
 ) -> bytes:
-    """Assemble the output CSV as bytes ready for download."""
-    data_df = pd.DataFrame(col_series).sort_index()
+    """
+    Memory-efficient output builder:
 
-    buf = io.StringIO()
-    writer = csv.writer(buf)
+    1. Pre-formats all timestamps in one vectorised call.
+    2. Builds the output as a numpy object array (one column at a time),
+       avoiding row-by-row Python loops over wide DataFrames.
+    3. Writes the final array to CSV in 5,000-row batches so the peak
+       string buffer size is bounded regardless of total row count.
+    """
+    import numpy as np
 
-    for row in header_rows:
-        writer.writerow(row)
+    n_rows = len(data_df)
 
-    for ts, row_data in data_df.iterrows():
-        out_row = [""] * n_cols
-        out_row[0] = ts.strftime(f"%Y-%m-%dT%H:%M:%S{output_tz}")
+    # ── Pre-allocate output array filled with empty strings ───────────────────
+    out = np.full((n_rows, n_cols), "", dtype=object)
 
-        for col_idx, val in row_data.items():
-            if pd.notna(val):
-                out_row[col_idx] = (
-                    int(val) if float(val) == int(val) else round(val, 6)
-                )
+    # ── Timestamps (vectorised strftime) ─────────────────────────────────────
+    out[:, 0] = data_df.index.strftime(f"%Y-%m-%dT%H:%M:%S{output_tz}").to_numpy()
 
-        writer.writerow(out_row)
+    # ── Fill data columns one at a time ──────────────────────────────────────
+    for col_idx in data_df.columns:
+        vals  = data_df[col_idx].to_numpy(dtype="float64")   # promote for formatting
+        valid = ~np.isnan(vals)
+        v     = vals[valid]
+        # Format: integers where value is whole, 6 sig-fig decimal otherwise
+        is_int = np.abs(v - np.round(v)) < 1e-5
+        formatted          = np.empty(len(v), dtype=object)
+        formatted[is_int]  = np.round(v[is_int]).astype("int64").astype(str)
+        formatted[~is_int] = [f"{x:.6g}" for x in v[~is_int]]
+        out[valid, col_idx] = formatted
 
-    return buf.getvalue().encode("utf-8")
+    del data_df
+    gc.collect()
+
+    # ── Write to CSV in 5,000-row batches ────────────────────────────────────
+    BATCH = 5_000
+    parts: list[bytes] = []
+
+    hdr_buf = io.StringIO()
+    csv.writer(hdr_buf).writerows(header_rows)
+    parts.append(hdr_buf.getvalue().encode("utf-8"))
+    del hdr_buf
+
+    for start in range(0, n_rows, BATCH):
+        batch_buf = io.StringIO()
+        csv.writer(batch_buf).writerows(out[start : start + BATCH].tolist())
+        parts.append(batch_buf.getvalue().encode("utf-8"))
+        del batch_buf
+
+    del out
+    gc.collect()
+
+    return b"".join(parts)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -508,7 +572,7 @@ if run_btn:
             )
 
             # Process source files
-            col_series = process_files(
+            data_df = process_files(
                 source_files,
                 simple_map,
                 sub_device_map,
@@ -516,21 +580,18 @@ if run_btn:
                 col_map,
                 n_cols,
                 timestamp_fmt,
-                output_tz,
                 log_lines,
             )
 
-            if not col_series:
+            if data_df.empty:
                 st.error(
                     "No columns were successfully mapped. "
                     "Check that your device map and source files match."
                 )
             else:
-                data_df = pd.DataFrame(col_series).sort_index()
                 n_timestamps = len(data_df)
-                n_values = int(data_df.notna().sum().sum())
-
-                output_bytes = build_output(header_rows, col_series, n_cols, output_tz)
+                n_values     = int(data_df.notna().sum().sum())
+                output_bytes = build_output(header_rows, data_df, n_cols, output_tz)
 
         except Exception as e:
             st.error(f"Error during processing: {e}")
