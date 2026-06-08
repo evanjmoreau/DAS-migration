@@ -13,6 +13,7 @@ import csv
 import gc
 import io
 import logging
+import zipfile
 from pathlib import Path
 
 import pandas as pd
@@ -449,6 +450,70 @@ def build_output(
     return b"".join(parts)
 
 
+
+def build_split_zip(
+    header_rows: list,
+    data_df:     pd.DataFrame,
+    n_cols:      int,
+    output_tz:   str,
+    period:      str,           # "monthly" | "quarterly"
+) -> tuple[bytes, list[str]]:
+    """
+    Split data_df by calendar period, write one CSV per period (each with the
+    full template header), and bundle them into an in-memory zip archive.
+
+    Returns (zip_bytes, list_of_filenames).
+    """
+    import numpy as np
+
+    # ── Group timestamps by period ────────────────────────────────────────────
+    if period == "monthly":
+        groups = data_df.groupby(data_df.index.to_period("M"))
+        fmt    = lambda p: f"wattch_upload_{p.year}_{p.month:02d}.csv"
+    else:   # quarterly
+        groups = data_df.groupby(data_df.index.to_period("Q"))
+        fmt    = lambda p: f"wattch_upload_{p.year}_Q{p.quarter}.csv"
+
+    zip_buf   = io.BytesIO()
+    filenames = []
+
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for period_label, chunk_df in groups:
+            fname = fmt(period_label)
+            filenames.append(fname)
+
+            n_rows = len(chunk_df)
+            out    = np.full((n_rows, n_cols), "", dtype=object)
+            out[:, 0] = chunk_df.index.strftime(
+                f"%Y-%m-%dT%H:%M:%S{output_tz}"
+            ).to_numpy()
+
+            for col_idx in chunk_df.columns:
+                vals  = chunk_df[col_idx].to_numpy(dtype="float64")
+                valid = ~np.isnan(vals)
+                v     = vals[valid]
+                if len(v) == 0:
+                    continue
+                is_int             = np.abs(v - np.round(v)) < 1e-5
+                formatted          = np.empty(len(v), dtype=object)
+                formatted[is_int]  = np.round(v[is_int]).astype("int64").astype(str)
+                formatted[~is_int] = [f"{x:.6g}" for x in v[~is_int]]
+                out[valid, col_idx] = formatted
+
+            # Write CSV for this period into the zip
+            csv_buf = io.StringIO()
+            w = csv.writer(csv_buf)
+            w.writerows(header_rows)
+            BATCH = 5_000
+            for start in range(0, n_rows, BATCH):
+                w.writerows(out[start : start + BATCH].tolist())
+
+            zf.writestr(fname, csv_buf.getvalue())
+            del csv_buf, out, chunk_df
+            gc.collect()
+
+    return zip_buf.getvalue(), filenames
+
 # ─────────────────────────────────────────────────────────────────────────────
 # STREAMLIT UI
 # ─────────────────────────────────────────────────────────────────────────────
@@ -542,6 +607,15 @@ with cfg2:
         help="ISO-8601 offset appended to output timestamps, e.g. -05:00 or +00:00",
     )
 
+cfg3, _ = st.columns([1, 2])
+with cfg3:
+    split_mode = st.selectbox(
+        "Output file splitting",
+        options=["Single file", "Split by month", "Split by quarter"],
+        index=0,
+        help="Split into multiple CSVs if your upload portal has a file-size limit.",
+    )
+
 st.divider()
 
 # ── Run ───────────────────────────────────────────────────────────────────────
@@ -602,7 +676,14 @@ if run_btn:
                 n_timestamps  = len(data_df)
                 n_values      = int(data_df.notna().sum().sum())
                 n_mapped_cols = len(data_df.columns)
-                output_bytes  = build_output(header_rows, data_df, n_cols, output_tz)
+
+                if split_mode == "Single file":
+                    output_bytes = build_output(header_rows, data_df, n_cols, output_tz)
+                else:
+                    period = "monthly" if split_mode == "Split by month" else "quarterly"
+                    output_bytes, split_filenames = build_split_zip(
+                        header_rows, data_df, n_cols, output_tz, period
+                    )
 
         except Exception as e:
             st.error(f"Error during processing: {e}")
@@ -615,13 +696,24 @@ if run_btn:
             f"{n_values:,} data values mapped across "
             f"{n_mapped_cols} template columns"
         )
-        st.download_button(
-            label="⬇  Download output CSV",
-            data=output_bytes,
-            file_name="wattch_upload_output.csv",
-            mime="text/csv",
-            type="primary",
-        )
+        if split_mode == "Single file":
+            st.download_button(
+                label="⬇  Download output CSV",
+                data=output_bytes,
+                file_name="wattch_upload_output.csv",
+                mime="text/csv",
+                type="primary",
+            )
+        else:
+            st.caption(f"Split into {len(split_filenames)} files: "
+                       f"{', '.join(split_filenames)}")
+            st.download_button(
+                label=f"⬇  Download {len(split_filenames)}-file zip",
+                data=output_bytes,
+                file_name="wattch_upload_split.zip",
+                mime="application/zip",
+                type="primary",
+            )
 
     with st.expander("Processing log", expanded=not output_bytes):
         st.code("\n".join(log_lines), language=None)
