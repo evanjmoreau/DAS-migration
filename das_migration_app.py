@@ -226,6 +226,39 @@ def get_device_prefix(name: str) -> str | None:
     return None
 
 
+
+def find_unclaimed_col(
+    wid: str,
+    wm:  str,
+    pi,
+    col_map:      dict,
+    claimed_cols: set,
+) -> tuple:
+    """
+    Find the best available template column for a (device, metric, phase_idx) triple.
+
+    Strategy (in order):
+      1. Try the exact phase_idx from the field map.
+      2. If not found or claimed, try idx=None  (standalone single-channel sensors).
+      3. If still not found or claimed, auto-increment idx 1→9  (handles same-device
+         multi-channel sensors like front/back of module on a single pyranometer).
+
+    Returns (col_idx, actual_phase_idx) or (None, None) if nothing is available.
+    This lets TMP02 claim SURFACE_TEMPERATURE idx=1 and TMP04 automatically
+    fall through to idx=2 on the same device without any hardcoded mappings.
+    """
+    candidates = [pi]
+    if pi is not None:
+        candidates.append(None)          # fallback to no-index variant
+    candidates += [i for i in range(1, 10) if i != pi]   # try idx 1-9
+
+    for candidate_pi in candidates:
+        cidx = col_map.get((wid, wm, candidate_pi))
+        if cidx is not None and cidx not in claimed_cols:
+            return cidx, candidate_pi
+
+    return None, None
+
 def process_files(
     source_files,
     simple_map:         dict,
@@ -274,6 +307,13 @@ def process_files(
                 continue
             log(f"▸  {uploaded.name}  →  Wattch ID: {wattch_id}")
 
+        # ── For multi-device files, log the sub-device map so mismatches are visible
+        if is_multi:
+            log(f"   Sub-device map entries for this file:")
+            for sd, wid in sorted(sub_device_map.items()):
+                log(f"     {sd} → {wid}")
+            log("")
+
         # ── Read in 50k-row chunks; free raw bytes immediately ────────────────
         raw = uploaded.read()
         chunk_iter = pd.read_csv(
@@ -315,33 +355,36 @@ def process_files(
                         sub_dev, m_suffix = parts[-2], parts[-1]
                         wid = sub_device_map.get(sub_dev)
                         if not wid:
+                            log(f"   ✗  {src_col}: sub-device '{sub_dev}' not found in device map — skipped")
                             continue
                         mapping = MET_SUFFIX_MAP.get(m_suffix)
                         if not mapping:
+                            log(f"   ✗  {src_col}: metric suffix '{m_suffix}' not in MET_SUFFIX_MAP — skipped")
                             continue
                         wm, pi = mapping
-                        cidx = col_map.get((wid, wm, pi))
-                        if cidx is not None and cidx not in claimed_cols:
+                        cidx, actual_pi = find_unclaimed_col(wid, wm, pi, col_map, claimed_cols)
+                        if cidx is not None:
                             col_idx_map[src_col] = cidx
                             claimed_cols.add(cidx)
-                            log(f"   ✓  {src_col} → {wid}/{wm} [idx={pi}] → col {cidx}")
+                            suffix_note = f" (auto idx={actual_pi})" if actual_pi != pi else ""
+                            log(f"   ✓  {src_col} → {wid}/{wm} [idx={actual_pi}]{suffix_note} → col {cidx}")
                             file_mapped += 1
-                        elif cidx in claimed_cols:
-                            log(f"   –  {src_col} → col {cidx} already claimed by another source column, skipped")
+                        else:
+                            log(f"   ✗  {src_col} → ({wid}, {wm}, idx={pi}) — no available column in template")
                     else:
                         suffix  = src_col.split(".")[-1]
                         mapping = field_map.get(suffix)
                         if not mapping:
                             continue
                         wm, pi  = mapping
-                        cidx    = col_map.get((wattch_id, wm, pi))
-                        if cidx is not None and cidx not in claimed_cols:
+                        cidx, actual_pi = find_unclaimed_col(wattch_id, wm, pi, col_map, claimed_cols)
+                        if cidx is not None:
                             col_idx_map[src_col] = cidx
                             claimed_cols.add(cidx)
                             log(f"   ✓  {src_col} → col {cidx}")
                             file_mapped += 1
-                        elif cidx in claimed_cols:
-                            log(f"   –  {src_col} → col {cidx} already claimed by another source column, skipped")
+                        else:
+                            log(f"   ✗  {src_col} → ({wattch_id}, {wm}, idx={pi}) — no available column in template")
 
             if not col_idx_map:
                 break
@@ -382,7 +425,19 @@ def process_files(
         gc.collect()
 
     log(f"Total columns mapped: {total_mapped}")
-    return accumulator.sort_index() if accumulator is not None else pd.DataFrame()
+
+    if accumulator is not None:
+        acc = accumulator.sort_index()
+        # Report non-null value counts per column so missing data is visible
+        log("\n── Column data summary (non-null row counts) ────────────────────")
+        for col_idx in sorted(acc.columns):
+            n_valid = int(acc[col_idx].notna().sum())
+            if n_valid == 0:
+                log(f"   ⚠  template col {col_idx}: 0 non-null values — column will be empty in output")
+            else:
+                log(f"   ✓  template col {col_idx}: {n_valid:,} non-null values")
+        return acc
+    return pd.DataFrame()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
