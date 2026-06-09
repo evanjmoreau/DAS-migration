@@ -12,10 +12,10 @@ Run with:
 import csv
 import gc
 import io
-import logging
 import zipfile
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -102,12 +102,32 @@ MET_SUFFIX_MAP = {
     "HUMIDITY":             ("HUMIDITY",                         None),
     "WIND_DIRECTION":       ("WIND_BEARING",                     None),
     "WIND_SPEED":           ("WIND_SPEED",                       None),
+    "PRECIPITATION":        ("PRECIPITATION_INTENSITY",          None),
+}
+
+RCL_FIELD_MAP = {
+    # AC input currents (phases A/B/C, then neutral and ground)
+    "AC_CURRENT_A":            ("AC_INPUT_CURRENT",              1),
+    "AC_CURRENT_B":            ("AC_INPUT_CURRENT",              2),
+    "AC_CURRENT_C":            ("AC_INPUT_CURRENT",              3),
+    "AC_CURRENT_N":            ("AC_INPUT_CURRENT",              4),
+    "AC_CURRENT_GND":          ("AC_INPUT_CURRENT",              5),
+    # AC input voltages (phase-to-neutral; Z-terminal = zero-sequence)
+    "AC_VOLTAGE_A":            ("AC_INPUT_VOLTAGE",              1),
+    "AC_VOLTAGE_B":            ("AC_INPUT_VOLTAGE",              2),
+    "AC_VOLTAGE_C":            ("AC_INPUT_VOLTAGE",              3),
+    "AC_VOLTAGE_A_Z_TERMINAL": ("AC_INPUT_VOLTAGE",              4),
+    "AC_VOLTAGE_B_Z_TERMINAL": ("AC_INPUT_VOLTAGE",              5),
+    "AC_VOLTAGE_C_Z_TERMINAL": ("AC_INPUT_VOLTAGE",              6),
+    # Breaker state
+    "STATUS_BREAKER":          ("STATE_ENUM",                    None),
 }
 
 DEVICE_FIELD_MAPS = {
     "INV": INV_FIELD_MAP,
     "MTR": MTR_FIELD_MAP,
     "UPS": UPS_FIELD_MAP,
+    "RCL": RCL_FIELD_MAP,
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -139,6 +159,10 @@ def parse_device_map(uploaded_file) -> tuple[dict, dict, set]:
     df = pd.read_excel(uploaded_file, header=None, dtype=str).fillna("")
 
     simple_map         = {}
+    # sub_device_map is scoped per source file stem so that MET01, MET02, MET03
+    # etc. can each have sub-devices with identical names (TMP01, PYR01 …)
+    # without overwriting each other.
+    # Structure:  { file_stem: { sub_device_id: wattch_id } }
     sub_device_map     = {}
     multi_device_stems = set()
     current_parent     = None
@@ -155,13 +179,16 @@ def parse_device_map(uploaded_file) -> tuple[dict, dict, set]:
             # ── Multi-device parent row ──────────────────────────────────────
             current_parent = col1
             multi_device_stems.add(col1)
+            if col1 not in sub_device_map:
+                sub_device_map[col1] = {}
             for sub_id in [s.strip() for s in col2.split(",") if s.strip()]:
-                sub_device_map[sub_id] = col3
+                sub_device_map[col1][sub_id] = col3
 
         elif col2 and not col1:
             # ── Multi-device continuation row ────────────────────────────────
-            for sub_id in [s.strip() for s in col2.split(",") if s.strip()]:
-                sub_device_map[sub_id] = col3
+            if current_parent:
+                for sub_id in [s.strip() for s in col2.split(",") if s.strip()]:
+                    sub_device_map[current_parent][sub_id] = col3
 
         elif col1 and not col2:
             # ── Simple 1:1 device row ────────────────────────────────────────
@@ -169,7 +196,6 @@ def parse_device_map(uploaded_file) -> tuple[dict, dict, set]:
             simple_map[col1] = col3
 
     return simple_map, sub_device_map, multi_device_stems
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TEMPLATE PARSING
@@ -214,7 +240,6 @@ def parse_template(uploaded_file) -> tuple[list, dict, int]:
 
     return all_rows[:6], col_map, len(device_row)
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # COLUMN PROCESSING
 # ─────────────────────────────────────────────────────────────────────────────
@@ -224,8 +249,6 @@ def get_device_prefix(name: str) -> str | None:
         if name.upper().startswith(prefix):
             return prefix
     return None
-
-
 
 def find_unclaimed_col(
     wid: str,
@@ -265,7 +288,6 @@ def process_files(
     sub_device_map:     dict,
     multi_device_stems: set,
     col_map:            dict,
-    n_cols:             int,
     timestamp_fmt:      str,
     log_lines:          list,
 ) -> pd.DataFrame:
@@ -307,10 +329,11 @@ def process_files(
                 continue
             log(f"▸  {uploaded.name}  →  Wattch ID: {wattch_id}")
 
-        # ── For multi-device files, log the sub-device map so mismatches are visible
+        # ── Resolve sub-device map once (multi-device files only) ──────────────────
+        file_sub_map = sub_device_map.get(stem, {}) if is_multi else {}
         if is_multi:
-            log(f"   Sub-device map entries for this file:")
-            for sd, wid in sorted(sub_device_map.items()):
+            log(f"   Sub-device map entries for {stem}:")
+            for sd, wid in sorted(file_sub_map.items()):
                 log(f"     {sd} → {wid}")
             log("")
 
@@ -353,9 +376,9 @@ def process_files(
                         if len(parts) < 2:
                             continue
                         sub_dev, m_suffix = parts[-2], parts[-1]
-                        wid = sub_device_map.get(sub_dev)
+                        wid = file_sub_map.get(sub_dev)
                         if not wid:
-                            log(f"   ✗  {src_col}: sub-device '{sub_dev}' not found in device map — skipped")
+                            log(f"   ✗  {src_col}: sub-device '{sub_dev}' not found in device map for {stem} — skipped")
                             continue
                         mapping = MET_SUFFIX_MAP.get(m_suffix)
                         if not mapping:
@@ -439,7 +462,6 @@ def process_files(
         return acc
     return pd.DataFrame()
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # OUTPUT GENERATION
 # ─────────────────────────────────────────────────────────────────────────────
@@ -459,8 +481,6 @@ def build_output(
     3. Writes the final array to CSV in 5,000-row batches so the peak
        string buffer size is bounded regardless of total row count.
     """
-    import numpy as np
-
     n_rows = len(data_df)
 
     # ── Pre-allocate output array filled with empty strings ───────────────────
@@ -504,8 +524,6 @@ def build_output(
 
     return b"".join(parts)
 
-
-
 def build_split_zip(
     header_rows: list,
     data_df:     pd.DataFrame,
@@ -519,8 +537,6 @@ def build_split_zip(
 
     Returns (zip_bytes, list_of_filenames).
     """
-    import numpy as np
-
     # ── Group timestamps by period ────────────────────────────────────────────
     if period == "monthly":
         groups = data_df.groupby(data_df.index.to_period("M"))
@@ -532,6 +548,7 @@ def build_split_zip(
     zip_buf   = io.BytesIO()
     filenames = []
 
+    BATCH = 5_000
     with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for period_label, chunk_df in groups:
             fname = fmt(period_label)
@@ -559,7 +576,6 @@ def build_split_zip(
             csv_buf = io.StringIO()
             w = csv.writer(csv_buf)
             w.writerows(header_rows)
-            BATCH = 5_000
             for start in range(0, n_rows, BATCH):
                 w.writerows(out[start : start + BATCH].tolist())
 
@@ -625,7 +641,8 @@ if device_map_file:
         device_map_file.seek(0)
         with st.expander(
             f"Device map preview — {len(_simple)} simple devices, "
-            f"{len(_sub)} sub-devices, multi-device files: {_multi or 'none'}"
+            f"{sum(len(v) for v in _sub.values())} sub-devices across "
+            f"{len(_sub)} multi-device file(s): {_multi or 'none'}"
         ):
             if _simple:
                 st.markdown("**Simple devices (1 file → 1 Wattch ID)**")
@@ -634,9 +651,14 @@ if device_map_file:
                     hide_index=True, use_container_width=True,
                 )
             if _sub:
-                st.markdown("**Sub-devices (multi-device file)**")
+                st.markdown("**Sub-devices (multi-device files)**")
+                rows = [
+                    {"File": stem, "Sub-device ID": sd, "Wattch ID": wid}
+                    for stem, mapping in _sub.items()
+                    for sd, wid in mapping.items()
+                ]
                 st.dataframe(
-                    pd.DataFrame(_sub.items(), columns=["Sub-device ID", "Wattch ID"]),
+                    pd.DataFrame(rows),
                     hide_index=True, use_container_width=True,
                 )
     except Exception as e:
@@ -698,7 +720,7 @@ if run_btn:
             )
             log_lines.append(
                 f"Device map: {len(simple_map)} simple devices, "
-                f"{len(sub_device_map)} sub-devices, "
+                f"{sum(len(v) for v in sub_device_map.values())} sub-devices, "
                 f"multi-device files: {multi_device_stems or 'none'}\n"
             )
 
@@ -717,7 +739,6 @@ if run_btn:
                 sub_device_map,
                 multi_device_stems,
                 col_map,
-                n_cols,
                 timestamp_fmt,
                 log_lines,
             )
