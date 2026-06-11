@@ -74,8 +74,8 @@ MTR_FIELD_MAP = {
     "POWER_FACTOR":     ("AC_INPUT_POWER_FACTOR",                None),
     "SVA":              ("AC_INPUT_POWER_APPARENT",              None),
     "VAR":              ("AC_INPUT_POWER_REACTIVE",              None),
-    "ENERGY_DELIVERED": ("LIFETIME_INPUT_ENERGY_EXPORT",         None),
-    "ENERGY_RECEIVED":  ("LIFETIME_INPUT_ENERGY_IMPORT",         None),
+    "ENERGY_DELIVERED": ("LIFETIME_INPUT_ENERGY_IMPORT",         None),
+    "ENERGY_RECEIVED":  ("LIFETIME_INPUT_ENERGY_EXPORT",         None),
 }
 
 UPS_FIELD_MAP = {
